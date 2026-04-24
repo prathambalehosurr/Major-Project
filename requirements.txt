@@ -1,0 +1,8 @@
+Flask>=3.0
+numpy>=1.26
+Pillow>=10.0
+torch>=2.0
+torchvision>=0.15
+gdown>=5.0
+h5py>=3.10
+scikit-learn>=1.4

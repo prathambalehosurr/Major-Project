@@ -1,0 +1,6 @@
+.venv/
+.tmp/
+dataset/
+models/*.pt
+__pycache__/
+*.pyc
