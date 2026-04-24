@@ -13,30 +13,17 @@ Runtime > Change runtime type > T4 GPU
 ## 2. Clone the Repository
 
 ```bash
-!git clone https://github.com/shsarv/Machine-Learning-Projects.git
-%cd "Machine-Learning-Projects/BRAIN TUMOR DETECTION [END 2 END]"
+!git clone https://github.com/prathambalehosurr/brain-tumor-detection.git
+%cd brain-tumor-detection
 ```
-
-If you are using your local edited copy instead, upload this project folder to Drive and `%cd` into it.
 
 ## 3. Install Dependencies
 
 ```bash
-!pip install -q torch torchvision flask pillow h5py scikit-learn
+!pip install -q -r requirements.txt
 ```
 
-## 4. Upload Local Project Files
-
-If you cloned the original GitHub repo, upload these local files from this project folder into the current Colab directory:
-
-```text
-train_resnet50.py
-model_architecture.py
-```
-
-If you pushed your edited repo to GitHub first, this step is not needed.
-
-## 5. Train and Export the Model
+## 4. Train and Export the Model
 
 Fast starter run, trains the classifier head and CBAM blocks:
 
@@ -48,6 +35,12 @@ Higher-quality run, fine-tunes all ResNet50 + CBAM layers:
 
 ```bash
 !python train_resnet50.py --download-data --attention cbam --fine-tune --epochs 35 --image-size 512 --batch-size 8 --lr 3e-4 --backbone-lr 3e-5 --weight-decay 1e-4 --label-smoothing 0.03 --amp --output models/bt_resnet50_model.pt
+```
+
+If Colab runs out of GPU memory, use the smaller 384px version:
+
+```bash
+!python train_resnet50.py --download-data --attention cbam --fine-tune --epochs 35 --image-size 384 --batch-size 12 --lr 3e-4 --backbone-lr 3e-5 --weight-decay 1e-4 --label-smoothing 0.03 --amp --output models/bt_resnet50_model.pt
 ```
 
 The script downloads the Figshare dataset from:
@@ -65,7 +58,7 @@ It expects 3,064 `.mat` files and trains with the same output shape as the Flask
 3 = Pituitary
 ```
 
-## 6. Download the Trained Weights
+## 5. Download the Trained Weights
 
 ```python
 from google.colab import files
