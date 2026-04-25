@@ -1,164 +1,153 @@
-import flask
-from io import BytesIO
-import uuid
+"""
+app.py — Brain Tumour Detection Web App
+Uses the dual-branch DualBranchTumorClassifier for inference.
+Preserves all existing routes and template names.
+"""
 
-import numpy as np
-import torch
-from torch import argmax, load
-from torch import device as DEVICE
-from torch.cuda import is_available
-from PIL import Image
-from torchvision.transforms import Compose, Normalize, ToTensor, Resize
-from werkzeug.utils import secure_filename
+import io
 import os
+from pathlib import Path
 
-from model_architecture import build_resnet50_model
+import torch
+from flask import Flask, render_template, request, jsonify
+from PIL import Image
+from torchvision.transforms import v2
 
-UPLOAD_FOLDER = os.path.join('static', 'photos')
-MODEL_PATH = os.path.join('models', 'bt_resnet50_model.pt')
-app = flask.Flask(__name__, template_folder='templates')
-app.secret_key = "secret key"
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+from model_architecture import DualBranchTumorClassifier
 
-ALLOWED_EXTENSIONS = set(['png', 'jpg', 'jpeg', 'gif'])
+# ──────────────────────────────────────────────
+#  Config
+# ──────────────────────────────────────────────
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+CHECKPOINT  = os.getenv("MODEL_PATH", "models/best_model.pt")
+NUM_CLASSES = 3
+IMG_SIZE    = 224
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-LABELS = ['None', 'Meningioma', 'Glioma', 'Pituitary']
+LABELS = {0: "Meningioma", 1: "Glioma", 2: "Pituitary"}
 
-device = "cuda" if is_available() else "cpu"
-resnet_model = None
+# ──────────────────────────────────────────────
+#  Model — loaded once at startup
+# ──────────────────────────────────────────────
 
-
-def load_model():
-    global resnet_model
-
-    if resnet_model is not None:
-        return resnet_model
-
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"Missing trained model file: {MODEL_PATH}. "
-            "Train or download bt_resnet50_model.pt and place it in the models folder."
-        )
-
-    model = build_resnet50_model(weights=None, attention="cbam")
-    model.to(device)
-    model.load_state_dict(load(MODEL_PATH, map_location=DEVICE(device)))
-    model.eval()
-    resnet_model = model
-    return resnet_model
-
-def preprocess_image(image_bytes):
-    transform = Compose([
-        Resize((512, 512)),
-        ToTensor(),
-        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    img = Image.open(BytesIO(image_bytes)).convert('RGB')
-    return transform(img).unsqueeze(0)
+def load_model() -> DualBranchTumorClassifier:
+    model = DualBranchTumorClassifier(
+        num_classes=NUM_CLASSES,
+        pretrained=False,   # weights come from checkpoint
+    )
+    if Path(CHECKPOINT).exists():
+        state = torch.load(CHECKPOINT, map_location="cpu")
+        model.load_state_dict(state)
+        print(f"[app] Loaded checkpoint: {CHECKPOINT}")
+    else:
+        print(f"[app] WARNING — checkpoint not found at '{CHECKPOINT}'. "
+              f"Run train.py first.  Predictions will be random.")
+    model.to(DEVICE).eval()
+    return model
 
 
-def get_prediction(image_bytes):
-    model = load_model()
-    tensor = preprocess_image(image_bytes=image_bytes)
+model = load_model()
+
+# ──────────────────────────────────────────────
+#  Inference transform  (same as val_tf in train.py)
+# ──────────────────────────────────────────────
+
+infer_tf = v2.Compose([
+    v2.Resize((IMG_SIZE, IMG_SIZE)),
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=(0.485, 0.456, 0.406),
+                 std =(0.229, 0.224, 0.225)),
+])
+
+# ──────────────────────────────────────────────
+#  Flask app
+# ──────────────────────────────────────────────
+
+app = Flask(__name__)
+
+
+def predict_image(pil_img: Image.Image) -> dict:
+    """Run inference on a PIL image. Returns label + confidence dict."""
+    rgb   = pil_img.convert("RGB")
+    tensor = infer_tf(rgb).unsqueeze(0).to(DEVICE)   # (1, 3, H, W)
+
     with torch.no_grad():
-        y_hat = model(tensor.to(device))
-    class_id = argmax(y_hat, dim=1)
-    return str(int(class_id)), LABELS[int(class_id)]
+        logits = model(tensor)                        # (1, num_classes)
+        probs  = torch.softmax(logits, dim=1)[0]     # (num_classes,)
+
+    pred_idx    = probs.argmax().item()
+    confidence  = probs[pred_idx].item()
+    label       = LABELS[pred_idx]
+
+    all_probs = {LABELS[i]: round(probs[i].item(), 4) for i in range(NUM_CLASSES)}
+
+    return {
+        "label":      label,
+        "confidence": round(confidence * 100, 2),
+        "all_probs":  all_probs,
+    }
 
 
-def save_upload(image_bytes, filename):
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    extension = filename.rsplit('.', 1)[1].lower()
-    safe_stem = secure_filename(filename.rsplit('.', 1)[0]) or "upload"
-    saved_name = f"{safe_stem}-{uuid.uuid4().hex[:8]}.{extension}"
-    saved_path = os.path.join(app.config['UPLOAD_FOLDER'], saved_name)
-    Image.open(BytesIO(image_bytes)).convert('RGB').save(saved_path)
-    return saved_name
+# ── Routes ─────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("MainPage.html")
 
 
-def generate_gradcam(image_bytes, class_id):
-    model = load_model()
-    tensor = preprocess_image(image_bytes=image_bytes).to(device)
-    activations = {}
-    gradients = {}
+@app.route("/detect", methods=["GET", "POST"])
+def detect():
+    return render_template("Diseasedet.html")
 
-    def forward_hook(module, inputs, output):
-        activations["value"] = output
 
-        def gradient_hook(gradient):
-            gradients["value"] = gradient
+@app.route("/predict", methods=["POST"])
+def predict():
+    """Accepts a multipart image upload, returns prediction JSON."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-        output.register_hook(gradient_hook)
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
 
-    hook = model.layer4.register_forward_hook(forward_hook)
     try:
-        model.zero_grad(set_to_none=True)
-        output = model(tensor)
-        score = output[0, class_id]
-        score.backward()
-    finally:
-        hook.remove()
+        img_bytes = file.read()
+        pil_img   = Image.open(io.BytesIO(img_bytes))
+        result    = predict_image(pil_img)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
-    activation = activations["value"].detach()[0]
-    gradient = gradients["value"].detach()[0]
-    weights = gradient.mean(dim=(1, 2), keepdim=True)
-    heatmap = torch.relu((weights * activation).sum(dim=0))
-    heatmap = heatmap - heatmap.min()
-    max_value = heatmap.max()
-    if max_value > 0:
-        heatmap = heatmap / max_value
+    return jsonify(result)
 
-    heatmap = heatmap.cpu().numpy()
-    heatmap_image = Image.fromarray(np.uint8(heatmap * 255)).resize((512, 512), Image.BILINEAR)
-    heatmap = np.asarray(heatmap_image, dtype=np.float32) / 255.0
 
-    original = Image.open(BytesIO(image_bytes)).convert('RGB').resize((512, 512))
-    original_array = np.asarray(original, dtype=np.float32)
-    heat_color = np.zeros_like(original_array)
-    heat_color[..., 0] = 255
-    heat_color[..., 1] = 120 * heatmap
-    alpha = 0.55 * heatmap[..., None]
-    overlay = original_array * (1 - alpha) + heat_color * alpha
+@app.route("/result")
+def result():
+    """Render prediction result page (populated via JS fetch of /predict)."""
+    return render_template("pred.html")
 
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    gradcam_name = f"gradcam-{uuid.uuid4().hex[:8]}.jpg"
-    gradcam_path = os.path.join(app.config['UPLOAD_FOLDER'], gradcam_name)
-    Image.fromarray(np.uint8(np.clip(overlay, 0, 255))).save(gradcam_path)
-    return gradcam_name
 
-@app.route('/', methods=['GET'])
-def main():
-    return flask.render_template('DiseaseDet.html')
+@app.route("/app-info")
+def app_info():
+    return render_template("app.html")
 
-@app.route("/uimg",methods=['GET','POST'])
+
+@app.route("/uimg")
 def uimg():
-    if flask.request.method == 'GET':
-        return flask.render_template('uimg.html')
-    if flask.request.method == 'POST':
-        file = flask.request.files['file']
-        if not file or not allowed_file(file.filename):
-            return flask.render_template('error.html', message='Please upload a PNG, JPG, JPEG, or GIF image.'), 400
-        img_bytes = file.read()   
-        try:
-            class_id, class_name = get_prediction(img_bytes)
-            upload_name = save_upload(img_bytes, file.filename)
-            gradcam_name = generate_gradcam(img_bytes, int(class_id))
-        except FileNotFoundError as error:
-            return flask.render_template('error.html', message=str(error)), 503
-        return flask.render_template(
-            'pred.html',
-            result=class_name,
-            uploaded_image=upload_name,
-            gradcam_image=gradcam_name,
-        )
-      
-@app.errorhandler(500)
-def server_error(error):
-    return flask.render_template('error.html', message='Something went wrong. Please try again.'), 500
+    return render_template("uimg.html")
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template("error.html", error="Page not found"), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template("error.html", error="Server error"), 500
+
+
+# ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)

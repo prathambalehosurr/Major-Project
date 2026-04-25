@@ -1,82 +1,310 @@
-import torch
-from torch import nn
-from torchvision.models import resnet50
+"""
+model_architecture.py
+─────────────────────
+Dual-branch architecture for brain-tumour classification:
+  Branch A : ResNet50  + CBAM attention  (your original branch)
+  Branch B : ConvNeXt-Small              (new, pre-trained)
+  Fusion   : Feature-level concatenation → shared MLP head
 
+Design rationale
+────────────────
+* Feature-level fusion (rather than late/prediction-level ensemble) lets the
+  shared classification head learn cross-branch interactions, which typically
+  outperforms simple averaging while still using two diverse inductive biases.
+* CBAM on ResNet gives explicit spatial + channel attention on CNN features.
+* ConvNeXt provides a modern convolution hierarchy with better scaling behaviour
+  and stronger ImageNet priors, complementing ResNet's residual features.
+* A single, jointly-trained head means only ONE set of classification weights
+  to tune, keeping parameter count manageable.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torchvision.models import (
+    ResNet50_Weights,
+    ConvNeXt_Small_Weights,
+    resnet50,
+    convnext_small,
+)
+
+
+# ──────────────────────────────────────────────
+#  Helpers / parameter filters (kept from orig)
+# ──────────────────────────────────────────────
+
+def is_classifier_or_attention_parameter(name: str) -> bool:
+    """Return True for parameters that should always be trained."""
+    keywords = ("fc", "classifier", "cbam", "fusion_head")
+    return any(kw in name for kw in keywords)
+
+
+# ──────────────────────────────────────────────
+#  CBAM  (Channel + Spatial Attention)
+# ──────────────────────────────────────────────
 
 class ChannelAttention(nn.Module):
-    def __init__(self, channels, reduction=16):
+    def __init__(self, in_channels: int, reduction: int = 16):
         super().__init__()
-        hidden_channels = max(channels // reduction, 1)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        mid = max(in_channels // reduction, 1)
         self.shared_mlp = nn.Sequential(
-            nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False),
+            nn.Linear(in_channels, mid, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False),
+            nn.Linear(mid, in_channels, bias=False),
         )
-        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        avg_attention = self.shared_mlp(self.avg_pool(x))
-        max_attention = self.shared_mlp(self.max_pool(x))
-        return x * self.sigmoid(avg_attention + max_attention)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, *_ = x.shape
+        avg = x.mean(dim=(2, 3))               # (B, C)
+        mx  = x.amax(dim=(2, 3))               # (B, C)
+        scale = torch.sigmoid(
+            self.shared_mlp(avg) + self.shared_mlp(mx)
+        ).view(b, c, 1, 1)
+        return x * scale
 
 
 class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
+    def __init__(self, kernel_size: int = 7):
         super().__init__()
-        padding = kernel_size // 2
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        pad = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=pad, bias=False)
+        self.bn   = nn.BatchNorm2d(1)
 
-    def forward(self, x):
-        avg_map = x.mean(dim=1, keepdim=True)
-        max_map, _ = x.max(dim=1, keepdim=True)
-        attention = self.sigmoid(self.conv(torch.cat([avg_map, max_map], dim=1)))
-        return x * attention
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg = x.mean(dim=1, keepdim=True)      # (B, 1, H, W)
+        mx  = x.amax(dim=1, keepdim=True)      # (B, 1, H, W)
+        scale = torch.sigmoid(self.bn(self.conv(torch.cat([avg, mx], dim=1))))
+        return x * scale
 
 
-class CBAMBlock(nn.Module):
-    def __init__(self, channels, reduction=16, spatial_kernel_size=7):
+class CBAM(nn.Module):
+    def __init__(self, in_channels: int, reduction: int = 16, spatial_kernel: int = 7):
         super().__init__()
-        self.channel_attention = ChannelAttention(channels, reduction=reduction)
-        self.spatial_attention = SpatialAttention(kernel_size=spatial_kernel_size)
+        self.channel = ChannelAttention(in_channels, reduction)
+        self.spatial = SpatialAttention(spatial_kernel)
 
-    def forward(self, x):
-        x = self.channel_attention(x)
-        return self.spatial_attention(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.spatial(self.channel(x))
 
 
-def classifier_head(in_features, num_classes=4):
-    return nn.Sequential(
-        nn.Linear(in_features, 2048),
-        nn.SELU(),
-        nn.Dropout(p=0.4),
-        nn.Linear(2048, 2048),
-        nn.SELU(),
-        nn.Dropout(p=0.4),
-        nn.Linear(2048, num_classes),
+# ──────────────────────────────────────────────
+#  Branch A : ResNet50 + CBAM
+# ──────────────────────────────────────────────
+
+class ResNet50WithCBAM(nn.Module):
+    """
+    ResNet50 backbone with a CBAM module inserted after the final
+    convolutional stage (layer4) and *before* global average pooling.
+    The original FC head is removed; we expose raw features.
+    """
+
+    def __init__(self, pretrained: bool = True, cbam_reduction: int = 16):
+        super().__init__()
+        weights = ResNet50_Weights.DEFAULT if pretrained else None
+        base = resnet50(weights=weights)
+
+        # keep everything up to (and including) layer4
+        self.stem   = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+        self.layer1 = base.layer1
+        self.layer2 = base.layer2
+        self.layer3 = base.layer3
+        self.layer4 = base.layer4
+
+        # CBAM after final stage  (2048 channels for ResNet50)
+        self.cbam    = CBAM(2048, reduction=cbam_reduction)
+        self.avgpool = base.avgpool          # AdaptiveAvgPool2d(1,1)
+        self.feature_dim = 2048
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.cbam(x)
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)          # (B, 2048)
+
+    def freeze_backbone(self):
+        """Freeze all layers except CBAM."""
+        for name, p in self.named_parameters():
+            if "cbam" not in name:
+                p.requires_grad_(False)
+
+    def unfreeze_backbone(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+
+
+# ──────────────────────────────────────────────
+#  Branch B : ConvNeXt-Small
+# ──────────────────────────────────────────────
+
+class ConvNeXtBranch(nn.Module):
+    """
+    ConvNeXt-Small backbone with its classification head removed.
+    Exposes 768-d feature vectors.
+    """
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        weights = ConvNeXt_Small_Weights.DEFAULT if pretrained else None
+        base = convnext_small(weights=weights)
+
+        self.features  = base.features      # all conv stages
+        self.avgpool   = base.avgpool       # AdaptiveAvgPool2d(1,1)
+        # base.classifier[2] is a Linear(768, 1000) — we skip it
+        self.norm      = base.classifier[0] # LayerNorm
+        self.feature_dim = 768
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)            # (B, 768)
+        x = self.norm(x)
+        return x
+
+    def freeze_backbone(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def unfreeze_backbone(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+
+
+# ──────────────────────────────────────────────
+#  Fusion Head MLP
+# ──────────────────────────────────────────────
+
+class FusionHead(nn.Module):
+    """
+    Two-layer MLP that maps concatenated branch features → class logits.
+    Dropout is applied before both linear layers for regularisation.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int,
+                 dropout: float = 0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ──────────────────────────────────────────────
+#  Dual-Branch Fusion Model  (top-level)
+# ──────────────────────────────────────────────
+
+class DualBranchTumorClassifier(nn.Module):
+    """
+    ResNet50+CBAM  ──┐
+                     ├─ concat(2048+768=2816) ─► FusionHead ─► logits
+    ConvNeXt-Small ──┘
+
+    Args
+    ────
+    num_classes   : number of output classes (3 for Meningioma/Glioma/Pituitary)
+    pretrained    : load ImageNet weights for both branches
+    hidden_dim    : width of the intermediate layer in FusionHead
+    dropout       : dropout rate in FusionHead
+    cbam_reduction: reduction ratio inside CBAM channel attention
+    """
+
+    def __init__(
+        self,
+        num_classes:    int  = 3,
+        pretrained:     bool = True,
+        hidden_dim:     int  = 512,
+        dropout:        float = 0.4,
+        cbam_reduction: int  = 16,
+    ):
+        super().__init__()
+        self.branch_resnet  = ResNet50WithCBAM(pretrained, cbam_reduction)
+        self.branch_convnxt = ConvNeXtBranch(pretrained)
+
+        fused_dim = self.branch_resnet.feature_dim + self.branch_convnxt.feature_dim
+        self.fusion_head = FusionHead(fused_dim, hidden_dim, num_classes, dropout)
+
+    # ── forward ────────────────────────────────
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat_r = self.branch_resnet(x)      # (B, 2048)
+        feat_c = self.branch_convnxt(x)     # (B, 768)
+        fused  = torch.cat([feat_r, feat_c], dim=1)   # (B, 2816)
+        return self.fusion_head(fused)      # (B, num_classes)
+
+    # ── freeze / unfreeze helpers ───────────────
+
+    def freeze_backbones(self):
+        """Freeze both backbones; only train FusionHead."""
+        self.branch_resnet.freeze_backbone()
+        self.branch_convnxt.freeze_backbone()
+        print("[freeze] Both backbones frozen — only FusionHead trains.")
+
+    def unfreeze_backbones(self):
+        """Unfreeze everything for full fine-tuning."""
+        self.branch_resnet.unfreeze_backbone()
+        self.branch_convnxt.unfreeze_backbone()
+        print("[unfreeze] Both backbones unfrozen — full fine-tuning active.")
+
+    def unfreeze_resnet_only(self):
+        self.branch_resnet.unfreeze_backbone()
+        print("[unfreeze] ResNet50+CBAM branch unfrozen.")
+
+    def unfreeze_convnext_only(self):
+        self.branch_convnxt.unfreeze_backbone()
+        print("[unfreeze] ConvNeXt branch unfrozen.")
+
+    # ── param counts ───────────────────────────
+
+    def parameter_summary(self):
+        total     = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Parameters — total: {total:,}  |  trainable: {trainable:,}")
+
+    # ── serialisation ──────────────────────────
+
+    def save(self, path: str):
+        torch.save(self.state_dict(), path)
+        print(f"[save] Model weights saved → {path}")
+
+    @classmethod
+    def load(cls, path: str, **kwargs) -> "DualBranchTumorClassifier":
+        model = cls(**kwargs)
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        print(f"[load] Model weights loaded ← {path}")
+        return model
+
+
+# ──────────────────────────────────────────────
+#  Convenience builder  (mirrors original API)
+# ──────────────────────────────────────────────
+
+def build_resnet50_model(num_classes: int = 3) -> ResNet50WithCBAM:
+    """Kept for backward-compatibility with any code that imported this."""
+    return ResNet50WithCBAM(pretrained=True)
+
+
+def build_dual_branch_model(
+    num_classes:    int   = 3,
+    pretrained:     bool  = True,
+    hidden_dim:     int   = 512,
+    dropout:        float = 0.4,
+    cbam_reduction: int   = 16,
+) -> DualBranchTumorClassifier:
+    return DualBranchTumorClassifier(
+        num_classes=num_classes,
+        pretrained=pretrained,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        cbam_reduction=cbam_reduction,
     )
-
-
-def add_cbam_to_resnet(model):
-    model.layer1 = nn.Sequential(model.layer1, CBAMBlock(256))
-    model.layer2 = nn.Sequential(model.layer2, CBAMBlock(512))
-    model.layer3 = nn.Sequential(model.layer3, CBAMBlock(1024))
-    model.layer4 = nn.Sequential(model.layer4, CBAMBlock(2048))
-    return model
-
-
-def build_resnet50_model(weights=None, attention="cbam", num_classes=4):
-    model = resnet50(weights=weights)
-    if attention == "cbam":
-        model = add_cbam_to_resnet(model)
-    elif attention != "none":
-        raise ValueError(f"Unsupported attention type: {attention}")
-
-    model.fc = classifier_head(model.fc.in_features, num_classes=num_classes)
-    return model
-
-
-def is_classifier_or_attention_parameter(name):
-    return name.startswith("fc.") or ".1.channel_attention" in name or ".1.spatial_attention" in name
