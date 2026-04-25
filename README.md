@@ -6,12 +6,12 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Flask](https://img.shields.io/badge/Flask-Web%20App-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![ResNet50](https://img.shields.io/badge/ResNet50-Transfer%20Learning-blueviolet?style=for-the-badge)](https://pytorch.org/vision/stable/models/resnet.html)
-[![Accuracy](https://img.shields.io/badge/Accuracy-99.3%25-brightgreen?style=for-the-badge)](https://github.com/shsarv/Machine-Learning-Projects/tree/main/BRAIN%20TUMOR%20DETECTION%20%5BEND%202%20END%5D)
+[![Accuracy](https://img.shields.io/badge/Accuracy-99.3%25-brightgreen?style=for-the-badge)](https://github.com/prathambalehosurr/Brain-Tumor-Detection)
 [![License](https://img.shields.io/badge/License-MIT-1abc9c?style=for-the-badge)](../LICENSE.md)
 
 > A full **end-to-end deep learning web application** that classifies brain tumors in MRI scans into three tumor types using a **fine-tuned ResNet50** via Transfer Learning — achieving **99.3% accuracy** — deployed as a live Flask web app.
 
-[🔙 Back to Main Repository](https://github.com/shsarv/Machine-Learning-Projects)
+[🔙 Back to Main Repository](https://github.com/prathambalehosurr)
 
 </div>
 
@@ -227,8 +227,8 @@ BRAIN TUMOR DETECTION [END 2 END]/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/shsarv/Machine-Learning-Projects.git
-cd "Machine-Learning-Projects/BRAIN TUMOR DETECTION [END 2 END]"
+git clone https://github.com/prathambalehosurr/Brain-Tumor-Detection.git
+cd "Brain-Tumor-Detection"
 ```
 
 ### 2. Set up environment
@@ -358,8 +358,8 @@ python test.py --image path/to/mri_scan.jpg
 
 <div align="center">
 
-Part of the [Machine Learning Projects](https://github.com/shsarv/Machine-Learning-Projects) collection by [Sarvesh Kumar Sharma](https://github.com/shsarv)
+Made with ❤️ by [Pratham Balehosur](https://github.com/prathambalehosurr)
 
-⭐ Star the main repo if this helped you!
+⭐ Star this repo if it helped you!
 
 </div>
