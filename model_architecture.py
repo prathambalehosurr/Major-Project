@@ -56,8 +56,8 @@ class ChannelAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, *_ = x.shape
-        avg = x.mean(dim=(2, 3))               # (B, C)
-        mx  = x.amax(dim=(2, 3))               # (B, C)
+        avg = x.mean(dim=(2, 3))
+        mx  = x.amax(dim=(2, 3))
         scale = torch.sigmoid(
             self.shared_mlp(avg) + self.shared_mlp(mx)
         ).view(b, c, 1, 1)
@@ -72,8 +72,8 @@ class SpatialAttention(nn.Module):
         self.bn   = nn.BatchNorm2d(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg = x.mean(dim=1, keepdim=True)      # (B, 1, H, W)
-        mx  = x.amax(dim=1, keepdim=True)      # (B, 1, H, W)
+        avg = x.mean(dim=1, keepdim=True)
+        mx  = x.amax(dim=1, keepdim=True)
         scale = torch.sigmoid(self.bn(self.conv(torch.cat([avg, mx], dim=1))))
         return x * scale
 
@@ -94,9 +94,8 @@ class CBAM(nn.Module):
 
 class ResNet50WithCBAM(nn.Module):
     """
-    ResNet50 backbone with a CBAM module inserted after the final
-    convolutional stage (layer4) and *before* global average pooling.
-    The original FC head is removed; we expose raw features.
+    ResNet50 backbone with CBAM inserted after layer4, before global avg pool.
+    FC head removed — exposes raw 2048-d features.
     """
 
     def __init__(self, pretrained: bool = True, cbam_reduction: int = 16):
@@ -104,16 +103,13 @@ class ResNet50WithCBAM(nn.Module):
         weights = ResNet50_Weights.DEFAULT if pretrained else None
         base = resnet50(weights=weights)
 
-        # keep everything up to (and including) layer4
         self.stem   = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
         self.layer1 = base.layer1
         self.layer2 = base.layer2
         self.layer3 = base.layer3
         self.layer4 = base.layer4
-
-        # CBAM after final stage  (2048 channels for ResNet50)
         self.cbam    = CBAM(2048, reduction=cbam_reduction)
-        self.avgpool = base.avgpool          # AdaptiveAvgPool2d(1,1)
+        self.avgpool = base.avgpool
         self.feature_dim = 2048
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -127,7 +123,6 @@ class ResNet50WithCBAM(nn.Module):
         return torch.flatten(x, 1)          # (B, 2048)
 
     def freeze_backbone(self):
-        """Freeze all layers except CBAM."""
         for name, p in self.named_parameters():
             if "cbam" not in name:
                 p.requires_grad_(False)
@@ -143,8 +138,11 @@ class ResNet50WithCBAM(nn.Module):
 
 class ConvNeXtBranch(nn.Module):
     """
-    ConvNeXt-Small backbone with its classification head removed.
+    ConvNeXt-Small backbone with classification head removed.
     Exposes 768-d feature vectors.
+
+    IMPORTANT: self.norm (LayerNorm) must be applied BEFORE torch.flatten
+    because it expects a 4D input (B, C, H, W), not a 2D input (B, C).
     """
 
     def __init__(self, pretrained: bool = True):
@@ -152,17 +150,16 @@ class ConvNeXtBranch(nn.Module):
         weights = ConvNeXt_Small_Weights.DEFAULT if pretrained else None
         base = convnext_small(weights=weights)
 
-        self.features  = base.features      # all conv stages
-        self.avgpool   = base.avgpool       # AdaptiveAvgPool2d(1,1)
-        # base.classifier[2] is a Linear(768, 1000) — we skip it
-        self.norm      = base.classifier[0] # LayerNorm
+        self.features    = base.features        # all conv stages
+        self.avgpool     = base.avgpool         # AdaptiveAvgPool2d(1,1)
+        self.norm        = base.classifier[0]   # LayerNorm — expects 4D
         self.feature_dim = 768
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = self.avgpool(x)                # (B, 768, 1, 1) still 4D
-        x = self.norm(x)                   # LayerNorm needs 4D
-        x = torch.flatten(x, 1)            # (B, 768) flatten last
+        x = self.avgpool(x)                     # (B, 768, 1, 1) — still 4D
+        x = self.norm(x)                        # LayerNorm needs 4D input
+        x = torch.flatten(x, 1)                 # (B, 768) — flatten last
         return x
 
     def freeze_backbone(self):
@@ -180,8 +177,7 @@ class ConvNeXtBranch(nn.Module):
 
 class FusionHead(nn.Module):
     """
-    Two-layer MLP that maps concatenated branch features → class logits.
-    Dropout is applied before both linear layers for regularisation.
+    Two-layer MLP: concatenated branch features → class logits.
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, num_classes: int,
@@ -221,11 +217,11 @@ class DualBranchTumorClassifier(nn.Module):
 
     def __init__(
         self,
-        num_classes:    int  = 3,
-        pretrained:     bool = True,
-        hidden_dim:     int  = 512,
+        num_classes:    int   = 3,
+        pretrained:     bool  = True,
+        hidden_dim:     int   = 512,
         dropout:        float = 0.4,
-        cbam_reduction: int  = 16,
+        cbam_reduction: int   = 16,
     ):
         super().__init__()
         self.branch_resnet  = ResNet50WithCBAM(pretrained, cbam_reduction)
@@ -234,24 +230,20 @@ class DualBranchTumorClassifier(nn.Module):
         fused_dim = self.branch_resnet.feature_dim + self.branch_convnxt.feature_dim
         self.fusion_head = FusionHead(fused_dim, hidden_dim, num_classes, dropout)
 
-    # ── forward ────────────────────────────────
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat_r = self.branch_resnet(x)      # (B, 2048)
-        feat_c = self.branch_convnxt(x)     # (B, 768)
-        fused  = torch.cat([feat_r, feat_c], dim=1)   # (B, 2816)
-        return self.fusion_head(fused)      # (B, num_classes)
+        feat_r = self.branch_resnet(x)              # (B, 2048)
+        feat_c = self.branch_convnxt(x)             # (B, 768)
+        fused  = torch.cat([feat_r, feat_c], dim=1) # (B, 2816)
+        return self.fusion_head(fused)              # (B, num_classes)
 
     # ── freeze / unfreeze helpers ───────────────
 
     def freeze_backbones(self):
-        """Freeze both backbones; only train FusionHead."""
         self.branch_resnet.freeze_backbone()
         self.branch_convnxt.freeze_backbone()
         print("[freeze] Both backbones frozen — only FusionHead trains.")
 
     def unfreeze_backbones(self):
-        """Unfreeze everything for full fine-tuning."""
         self.branch_resnet.unfreeze_backbone()
         self.branch_convnxt.unfreeze_backbone()
         print("[unfreeze] Both backbones unfrozen — full fine-tuning active.")
@@ -264,14 +256,10 @@ class DualBranchTumorClassifier(nn.Module):
         self.branch_convnxt.unfreeze_backbone()
         print("[unfreeze] ConvNeXt branch unfrozen.")
 
-    # ── param counts ───────────────────────────
-
     def parameter_summary(self):
         total     = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Parameters — total: {total:,}  |  trainable: {trainable:,}")
-
-    # ── serialisation ──────────────────────────
 
     def save(self, path: str):
         torch.save(self.state_dict(), path)
@@ -286,11 +274,11 @@ class DualBranchTumorClassifier(nn.Module):
 
 
 # ──────────────────────────────────────────────
-#  Convenience builder  (mirrors original API)
+#  Convenience builders
 # ──────────────────────────────────────────────
 
 def build_resnet50_model(num_classes: int = 3) -> ResNet50WithCBAM:
-    """Kept for backward-compatibility with any code that imported this."""
+    """Kept for backward-compatibility."""
     return ResNet50WithCBAM(pretrained=True)
 
 
