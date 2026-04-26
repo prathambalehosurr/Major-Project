@@ -160,9 +160,9 @@ class ConvNeXtBranch(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)            # (B, 768)
-        x = self.norm(x)
+        x = self.avgpool(x)                # (B, 768, 1, 1) still 4D
+        x = self.norm(x)                   # LayerNorm needs 4D
+        x = torch.flatten(x, 1)            # (B, 768) flatten last
         return x
 
     def freeze_backbone(self):
