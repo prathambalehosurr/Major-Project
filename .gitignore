@@ -4,3 +4,4 @@ dataset/
 models/*.pt
 __pycache__/
 *.pyc
+venv/
