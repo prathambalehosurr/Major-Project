@@ -1,7 +1,6 @@
 """
 app.py — Brain Tumour Detection Web App
 Uses the dual-branch DualBranchTumorClassifier for inference.
-Preserves all existing routes and template names.
 """
 
 import io
@@ -9,7 +8,7 @@ import os
 from pathlib import Path
 
 import torch
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect, url_for
 from PIL import Image
 from torchvision.transforms import v2
 
@@ -33,7 +32,7 @@ LABELS = {0: "Meningioma", 1: "Glioma", 2: "Pituitary"}
 def load_model() -> DualBranchTumorClassifier:
     model = DualBranchTumorClassifier(
         num_classes=NUM_CLASSES,
-        pretrained=False,   # weights come from checkpoint
+        pretrained=False,
     )
     if Path(CHECKPOINT).exists():
         state = torch.load(CHECKPOINT, map_location="cpu")
@@ -41,7 +40,7 @@ def load_model() -> DualBranchTumorClassifier:
         print(f"[app] Loaded checkpoint: {CHECKPOINT}")
     else:
         print(f"[app] WARNING — checkpoint not found at '{CHECKPOINT}'. "
-              f"Run train.py first.  Predictions will be random.")
+              f"Run train.py first. Predictions will be random.")
     model.to(DEVICE).eval()
     return model
 
@@ -49,7 +48,7 @@ def load_model() -> DualBranchTumorClassifier:
 model = load_model()
 
 # ──────────────────────────────────────────────
-#  Inference transform  (same as val_tf in train.py)
+#  Inference transform
 # ──────────────────────────────────────────────
 
 infer_tf = v2.Compose([
@@ -69,18 +68,17 @@ app = Flask(__name__)
 
 def predict_image(pil_img: Image.Image) -> dict:
     """Run inference on a PIL image. Returns label + confidence dict."""
-    rgb   = pil_img.convert("RGB")
-    tensor = infer_tf(rgb).unsqueeze(0).to(DEVICE)   # (1, 3, H, W)
+    rgb    = pil_img.convert("RGB")
+    tensor = infer_tf(rgb).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        logits = model(tensor)                        # (1, num_classes)
-        probs  = torch.softmax(logits, dim=1)[0]     # (num_classes,)
+        logits = model(tensor)
+        probs  = torch.softmax(logits, dim=1)[0]
 
-    pred_idx    = probs.argmax().item()
-    confidence  = probs[pred_idx].item()
-    label       = LABELS[pred_idx]
-
-    all_probs = {LABELS[i]: round(probs[i].item(), 4) for i in range(NUM_CLASSES)}
+    pred_idx   = probs.argmax().item()
+    confidence = probs[pred_idx].item()
+    label      = LABELS[pred_idx]
+    all_probs  = {LABELS[i]: round(probs[i].item() * 100, 2) for i in range(NUM_CLASSES)}
 
     return {
         "label":      label,
@@ -96,14 +94,45 @@ def index():
     return render_template("MainPage.html")
 
 
-@app.route("/detect", methods=["GET", "POST"])
+@app.route("/detect")
 def detect():
     return render_template("Diseasedet.html")
 
 
+@app.route("/uimg", methods=["GET", "POST"])
+def uimg():
+    """GET — show upload form. POST — run prediction and show result."""
+    if request.method == "GET":
+        return render_template("uimg.html")
+
+    # POST — handle file upload and predict
+    if "file" not in request.files:
+        return render_template("error.html", error="No file uploaded"), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return render_template("error.html", error="No file selected"), 400
+
+    try:
+        img_bytes = file.read()
+        pil_img   = Image.open(io.BytesIO(img_bytes))
+        result    = predict_image(pil_img)
+    except Exception as exc:
+        return render_template("error.html", error=str(exc)), 500
+
+    return render_template(
+        "pred.html",
+        result         = result["label"],
+        confidence     = result["confidence"],
+        all_probs      = result["all_probs"],
+        uploaded_image = None,
+        gradcam_image  = None,
+    )
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Accepts a multipart image upload, returns prediction JSON."""
+    """JSON API endpoint for programmatic access."""
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
@@ -119,22 +148,6 @@ def predict():
         return jsonify({"error": str(exc)}), 500
 
     return jsonify(result)
-
-
-@app.route("/result")
-def result():
-    """Render prediction result page (populated via JS fetch of /predict)."""
-    return render_template("pred.html")
-
-
-@app.route("/app-info")
-def app_info():
-    return render_template("app.html")
-
-
-@app.route("/uimg")
-def uimg():
-    return render_template("uimg.html")
 
 
 @app.errorhandler(404)
